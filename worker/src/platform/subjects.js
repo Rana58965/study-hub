@@ -708,6 +708,85 @@ export async function editTopic(env, user, id, body, { actor = LEARNER, surface 
   return { topic: (await readTopic(env, user, id)).topic, batch_id: w.batch_id };
 }
 
+// ------------------------------------------------------------------ sections: rename, remove empty ones
+
+/**
+ * Renames one of a subject's sections ({name}), removes it ({remove: true}, only when no live topic is in it), or
+ * removes every empty section ({remove_empty: true}). ref is the section's id or name (unused for remove_empty).
+ * One undoable batch. Returns {changed, removed, batch_id}. Empty sections still count towards the section limit,
+ * so removing them is how a full subject makes room.
+ */
+export async function editSection(env, user, sid, ref, body, { actor = LEARNER, surface = 'web', via = 'platform:section' } = {}) {
+  if (!sidOk(sid)) throw notFoundSubject();
+  const [subj, units, counts] = await env.DB.batch([
+    statement(env, "SELECT id, name FROM subjects WHERE user_id = ?1 AND id = ?2 AND status = 'active'", user, sid),
+    statement(env, 'SELECT * FROM units WHERE user_id = ?1 AND category_id = ?2 ORDER BY checklist_order, num, id', user, sid),
+    statement(env, `SELECT unit_id, COUNT(*) AS n FROM topics WHERE user_id = ?1 AND category_id = ?2 AND status IN ${LIVE} AND unit_id IS NOT NULL GROUP BY unit_id`, user, sid),
+  ]);
+  if (!(subj.results || []).length) throw notFoundSubject();
+  const list = units.results || [];
+  const live = new Map((counts.results || []).map(r => [r.unit_id, Number(r.n) || 0]));
+  const t = nowMs();
+  const plan = new Plan();
+  const removeRow = u => {
+    const { user_id, id, ...before } = u;   // eslint-disable-line no-unused-vars
+    plan.add({ table: 'units', op: 'delete', key: { id }, before, after: null },
+      { kind: 'unit.updated', target_type: 'unit', target_id: id, summary: `Removed the empty section ${u.name}` });
+  };
+
+  if (body.remove_empty) {
+    const empty = list.filter(u => !live.get(u.id));
+    empty.forEach(removeRow);
+    if (!plan.rows.length) return { changed: [], removed: [], batch_id: null };
+    const w = await writeBatch(env, user, { actor, surface, via, rows: plan.rows, events: plan.events, undoable: true });
+    return { changed: ['removed'], removed: empty.map(u => u.name), batch_id: w.batch_id };
+  }
+
+  const want = typeof ref === 'string' ? ref.trim() : '';
+  if (!want || want.length > 120) throw new HttpError(400, 'Say which section.');
+  const unit = list.find(u => u.id === want) || list.find(u => norm(u.name) === norm(want));
+  if (!unit) throw new HttpError(404, `That subject has no section called ${want.slice(0, 60)}.`);
+
+  if (body.remove) {
+    const n = live.get(unit.id) || 0;
+    if (n) throw new HttpError(400, `${unit.name} still has ${n} topic${n === 1 ? '' : 's'}. Move or remove them first.`);
+    removeRow(unit);
+    const w = await writeBatch(env, user, { actor, surface, via, rows: plan.rows, events: plan.events, undoable: true });
+    return { changed: ['removed'], removed: [unit.name], batch_id: w.batch_id };
+  }
+
+  if (body.name == null) throw new HttpError(400, 'Say what to change: a new name, or remove.');
+  const name = requireName(body.name, 'The section');
+  if (name === unit.name) return { changed: [], removed: [], batch_id: null };
+  if (list.some(u => u.id !== unit.id && norm(u.name) === norm(name))) throw new HttpError(409, `This subject already has a section called ${name}.`);
+  plan.add({ table: 'units', op: 'update', key: { id: unit.id }, before: { name: unit.name }, after: { name, updated_at: t } },
+    { kind: 'unit.updated', target_type: 'unit', target_id: unit.id, summary: `Renamed the section ${unit.name} to ${name}` });
+  const w = await writeBatch(env, user, { actor, surface, via, rows: plan.rows, events: plan.events, undoable: true });
+  return { changed: ['name'], removed: [], name, batch_id: w.batch_id };
+}
+
+async function patchSection(request, env, ctx, params, url, user, session) {
+  requireModule(session, 'map', env);
+  const body = await readJson(request, 5_000);
+  return json(await editSection(env, user, params.id, params.sec, { name: body.name }));
+}
+
+async function deleteSection(request, env, ctx, params, url, user, session) {
+  requireModule(session, 'map', env);
+  return json(await editSection(env, user, params.id, params.sec, { remove: true }));
+}
+
+async function sectionEdit(env, user, a) {
+  const s = await findUserSubject(env, user, a.subject);
+  const action = a.action;
+  if (!['rename', 'remove', 'remove_empty'].includes(action)) throw new HttpError(400, 'action is rename, remove or remove_empty.');
+  if (action !== 'remove_empty' && !a.section) throw new HttpError(400, 'Say which section.');
+  if (action === 'rename' && !a.name) throw new HttpError(400, 'Give the new name.');
+  const body = action === 'rename' ? { name: a.name } : action === 'remove' ? { remove: true } : { remove_empty: true };
+  const w = await editSection(env, user, s.id, a.section || null, body, { actor: 'claude', surface: 'chat', via: 'platform:section_edit' });
+  return { subject: s.name, ...w, undo: w.batch_id ? 'They can say "undo that" (undo_change).' : null };
+}
+
 // ------------------------------------------------------------------ gaps
 
 /**
@@ -822,6 +901,8 @@ export const ROUTES = [
   ['POST', '/api/p/subjects/:id/topics', postTopics],
   ['GET', '/api/p/topics/:id', getTopic],
   ['PATCH', '/api/p/topics/:id', patchTopic],
+  ['PATCH', '/api/p/subjects/:id/sections/:sec', patchSection],
+  ['DELETE', '/api/p/subjects/:id/sections/:sec', deleteSection],
   ['GET', '/api/p/today', today],
   ['POST', '/api/p/gaps', postGap],
   ['POST', '/api/p/undo', undo],
@@ -898,7 +979,11 @@ export async function subjectTopics(env, user, ref, sectionName = null) {
     if (!sections.length) throw new HttpError(404, 'That subject has no such section.');
   }
   const out = { subject: { id: d.subject.id, name: d.subject.name, board: d.subject.board_name, tier: d.subject.tier, ring: d.subject.ring }, sections, not_matched_yet: d.unplaced };
-  return fit(out, LIMITS.subject_topics_chars, [o => { const x = o.sections.slice().reverse().find(y => y.topics.length > 10); if (!x) return false; x.topics.pop(); return true; }]);
+  const fitted = fit(out, LIMITS.subject_topics_chars, [o => { const x = o.sections.slice().reverse().find(y => y.topics.length > 10); if (!x) return false; x.topics.pop(); return true; }]);
+  if (!fitted.truncated) return fitted;
+  // Too big to list every topic: name the sections with their sizes, so the next call can ask for one section.
+  return fit({ subject: out.subject, sections: sections.map(x => ({ name: x.name, topics_n: x.topics.length })), not_matched_yet: d.unplaced,
+    note: 'Too many topics to list at once: ask for one section with section.' }, LIMITS.subject_topics_chars, []);
 }
 
 /** One of their live topics by id or name (subjectRef narrows a shared name): {id}, or {ambiguous, candidates, note}. */
@@ -1001,6 +1086,10 @@ function boardId(v) {
 }
 
 async function subjectEdit(env, user, a) {
+  if (a.action === 'section' || a.action === 'clear_sections') {
+    return sectionEdit(env, user, { subject: a.subject, section: a.section, name: a.name,
+      action: a.action === 'clear_sections' ? 'remove_empty' : a.name ? 'rename' : 'remove' });
+  }
   const ctx = { actor: 'claude', surface: 'chat', via: 'platform:subject_edit' };
   const u = await statement(env, 'SELECT profile FROM users WHERE id = ?1', user).first();
   if (!u) throw new HttpError(404, 'There is no such account.');
@@ -1057,9 +1146,9 @@ const objSchema = (properties, required = []) => ({ type: 'object', properties, 
 export const TOOLS = [
   {
     name: 'subject_edit', module: 'map',
-    description: 'Changes the student\'s subjects when they ask: add a subject (from their track\'s list, or their own name), change its exam board, tier (GCSE: foundation or higher), spec code or exam year, rename it, remove it (topics kept), set the date of their first exam (date null clears it), or set their level (primary, gcse, alevel, university, other). One change they can undo (undo_change).',
-    inputSchema: objSchema({ action: { type: 'string', enum: ['add', 'change', 'remove', 'exam_date', 'level'] }, level: { type: 'string' }, subject: { type: 'string' }, board: { type: 'string' }, tier: { type: 'string' },
-      spec_code: { type: 'string' }, exam_year: { type: 'integer' }, name: { type: 'string' }, date: { type: ['string', 'null'], description: 'YYYY-MM-DD' } }, ['action']),
+    description: 'Changes their subjects on request: add one (from their track\'s list, or their own name); change its board, tier (GCSE: foundation or higher), spec code, exam year or name; remove it (topics kept); exam_date (null clears); level (primary, gcse, alevel, university, other); section: rename it (name) or, no name, remove it if empty; clear_sections: remove all empty sections (they count to the 40 cap). Undo: undo_change',
+    inputSchema: objSchema({ action: { type: 'string', enum: ['add', 'change', 'remove', 'exam_date', 'level', 'section', 'clear_sections'] }, level: { type: 'string' }, subject: { type: 'string' }, board: { type: 'string' }, tier: { type: 'string' },
+      spec_code: { type: 'string' }, exam_year: { type: 'integer' }, name: { type: 'string' }, section: { type: 'string' }, date: { type: ['string', 'null'], description: 'YYYY-MM-DD' } }, ['action']),
     run: subjectEdit,
   },
   {

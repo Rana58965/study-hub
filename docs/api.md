@@ -47,6 +47,8 @@ Invite links look like `https://<host>/#invite=<token>`; email reset links `http
 | `DELETE /api/p/subjects/:id` | | `{ok, batch_id}` (undo with `POST /api/p/undo`) |
 | `POST /api/p/subjects/:id/suggest` | `{section?, from_item?}` | `{sections: [{name, topics: [{name}]}], provider, usd}` (preview, writes nothing) |
 | `POST /api/p/subjects/:id/topics` | `{sections: [{name, topics: [{name}]}]}` | `{added: n, skipped: n, batch_id}` |
+| `PATCH /api/p/subjects/:id/sections/:sec` | `{name}` | `{changed, removed, name, batch_id}` (rename a section; undoable) |
+| `DELETE /api/p/subjects/:id/sections/:sec` | | `{changed, removed, batch_id}` (only an empty section; undoable) |
 | `GET /api/p/topics/:id` | | `{topic: {id, name, subject_id, section, band, t1000, seen, status}, recent: [{day, kind, result, source, label}], cards_n, gaps: [{at, gap}]}` |
 | `PATCH /api/p/topics/:id` | `{name?, section?, retired?: true}` | `{topic, batch_id}` |
 | `GET /api/p/today` | | `{name, track_label, days_to_exam: n or null, subjects: [{id, name, board_name, ring, weak_n}], weakest: [TopicChip & {subject_id, subject_name}] (up to 5), cards_due: n, last_results: [{id, bank, subject_id, day, label, right_n, total_n, marks, out_of}], modules: {id: bool}}` |

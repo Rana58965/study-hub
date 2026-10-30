@@ -112,10 +112,12 @@ function paintOne(root, data, app, path, back) {
 
   const secs = h('div', { class: 'card', style: 'margin-top:var(--gap)' }, data.sections.map(sec => {
     const chips = h('div', { class: 'chips' }, sec.topics.map(t => topicChip(t, () => openTopic(t.id, { app, subjectName: s.name, board: s.board_name, sections: data.sections, onChange: refresh }))));
+    const rename = sec.id ? btn('Rename', () => renameSectionSheet(s, sec, refresh), 'plain', 'pencil', { cls: 'btn-sm' }) : null;
+    const drop = sec.id && !sec.topics.length ? btn('Remove section', () => removeSection(s, sec, refresh), 'plain', 'trash', { cls: 'btn-sm' }) : null;
     return h('div', { class: 'sec cv' },
-      h('h3', null, sec.name, h('span', { class: 'aside' }, sec.topics.length ? String(sec.topics.length) : '')),
+      h('h3', null, sec.name, h('span', { class: 'aside' }, sec.topics.length ? String(sec.topics.length) : '', rename)),
       sec.topics.length ? chips : h('div', { class: 'row' }, h('span', { class: 'foot' }, 'No topics yet.'),
-        app.on('ai_topics') ? btn('Suggest for this section', () => suggestSheet(s, sec.name, refresh), 'plain', 'sparkle', { cls: 'btn-sm' }) : null));
+        app.on('ai_topics') ? btn('Suggest for this section', () => suggestSheet(s, sec.name, refresh), 'plain', 'sparkle', { cls: 'btn-sm' }) : null, drop));
   }));
 
   const remove = btn(`Remove ${s.name}`, async () => {
@@ -130,6 +132,32 @@ function paintOne(root, data, app, path, back) {
   }, 'danger', 'trash');
 
   root.replaceChildren(head, summary, secs, h('div', { style: 'margin-top:28px;display:flex;justify-content:center' }, remove));
+}
+
+// A section: rename it, or remove it once it is empty (empty sections still count towards a subject's 40).
+function renameSectionSheet(s, sec, done) {
+  const name = input({ value: sec.name, maxLength: 79 });
+  const save = btn('Save', null, 'primary');
+  const sh = sheet({ title: 'Rename section', sub: s.name, body: h('div', { class: 'form' }, field('Name', name)) });
+  save.addEventListener('click', () => busy(save, async () => {
+    try {
+      const r = await patch(`/api/p/subjects/${encodeURIComponent(s.id)}/sections/${encodeURIComponent(sec.id)}`, { name: name.value.trim() });
+      sh.close();
+      if (r.batch_id) toast('Section renamed', { undo: undoer(r.batch_id, done) });
+      done();
+    } catch (e) { toast(e.message); }
+  }));
+  sh.setActions(btn('Cancel', () => sh.close(), 'gray'), save);
+}
+
+async function removeSection(s, sec, done) {
+  const ok = await confirmSheet({ title: `Remove ${sec.name}?`, sub: 'It has no topics. You can undo this straight away.', ok: 'Remove', danger: true });
+  if (!ok) return;
+  try {
+    const r = await del(`/api/p/subjects/${encodeURIComponent(s.id)}/sections/${encodeURIComponent(sec.id)}`);
+    toast(`Removed ${sec.name}`, { undo: undoer(r.batch_id, done) });
+    done();
+  } catch (e) { toast(e.message); }
 }
 
 function boardSheet(s, done) {

@@ -798,3 +798,43 @@ test('ISOLATION: one person never reads or changes another\'s subjects, topics, 
   assert.equal(d.row("SELECT COUNT(*) AS n FROM map_events WHERE user_id = 'mo'").n, 0, 'nothing wrote events as Mo');
   d.close();
 });
+
+test('sections: rename one, remove an empty one (not one with topics), remove_empty makes room in a full subject; undo brings them back', async () => {
+  const { d, env } = platformEnv();
+  const g = await person(env, 'Gwen', 'gcse');
+  const b = await person(env, 'Bram', 'gcse');
+  await g.c.call('POST', '/api/p/subjects/gcse-maths/topics', { sections: [{ name: 'Number', topics: ['Fractions'] }] });
+  const units = () => d.rows("SELECT id, name FROM units WHERE user_id = ? AND category_id = 'gcse-maths' ORDER BY num", g.id);
+  const before = units().length;
+
+  const rn = await g.c.call('PATCH', '/api/p/subjects/gcse-maths/sections/gcse-maths-s1', { name: 'Numbers and fractions' });
+  assert.equal(rn.status, 200, JSON.stringify(rn.data));
+  assert.equal(units()[0].name, 'Numbers and fractions');
+  assert.equal((await g.c.call('PATCH', '/api/p/subjects/gcse-maths/sections/gcse-maths-s1', { name: 'Algebra' })).status, 409, 'no two sections share a name');
+
+  assert.equal((await g.c.call('DELETE', '/api/p/subjects/gcse-maths/sections/gcse-maths-s1')).status, 400, 'a section with topics stays');
+  assert.equal((await g.c.call('DELETE', '/api/p/subjects/gcse-maths/sections/no-such-section')).status, 404);
+  const bramUnits = d.row("SELECT COUNT(*) AS n FROM units WHERE user_id = ?", b.id).n;
+  const rm = await g.c.call('DELETE', '/api/p/subjects/gcse-maths/sections/gcse-maths-s2');
+  assert.equal(rm.status, 200, JSON.stringify(rm.data));
+  assert.deepEqual(rm.data.removed, ['Algebra']);
+  assert.equal(units().length, before - 1);
+  assert.equal((await g.c.call('POST', '/api/p/undo', { batch_id: rm.data.batch_id })).status, 200);
+  assert.equal(units().length, before, 'undo puts the section back');
+  assert.equal(d.row("SELECT COUNT(*) AS n FROM units WHERE user_id = ?", b.id).n, bramUnits, 'Bram\'s sections are never touched');
+
+  // A subject at the 40-section limit: remove_empty from the connector clears the empty ones and a new section fits.
+  const t = await connector(g.c);
+  await g.c.call('POST', '/api/p/subjects/gcse-maths/topics', { sections: Array.from({ length: 40 - before }, (_, i) => ({ name: `Extra ${i}`, topics: [`Extra topic ${i}`] })) });
+  assert.equal(units().length, 40);
+  const full = await t.call('topic_edit', { topic: 'Fractions', section: 'Brand new' });
+  assert.ok(full.error && /40 sections/.test(full.text), full.text);
+  const cleared = await t.call('subject_edit', { subject: 'Maths', action: 'clear_sections' });
+  assert.ok(!cleared.error, cleared.text);
+  assert.equal(cleared.data.removed.length, before - 1, 'every default section but Number had no topics');
+  const moved = await t.call('topic_edit', { topic: 'Fractions', section: 'Brand new' });
+  assert.ok(!moved.error, moved.text);
+  const renamed = await t.call('subject_edit', { subject: 'Maths', action: 'section', section: 'Brand new', name: 'Fractions and decimals' });
+  assert.deepEqual([renamed.error, renamed.data.name], [false, 'Fractions and decimals']);
+  d.close();
+});
