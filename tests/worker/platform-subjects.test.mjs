@@ -845,3 +845,24 @@ test('sections read in chapter order: numbered ones by their number, the rest af
     ['1 Atomic structure', '2 Amount of substance', '10 Group 7', '17 Thermodynamics', 'Practical skills', 'Extra']);
   assert.deepEqual(names(['Number', 'Algebra', 'Geometry']), ['Number', 'Algebra', 'Geometry'], 'nothing numbered: order kept');
 });
+
+test('a removed topic added again comes back in the section it was added to, not with no section; undo puts it back', async () => {
+  const { d, env } = platformEnv();
+  const g = await person(env, 'Gwen', 'gcse');
+  const t = await connector(g.c);
+  await g.c.call('POST', '/api/p/subjects/gcse-maths/topics', { sections: [{ name: 'Number', topics: ['Fractions'] }] });
+  const id = topicId(g.id, 'gcse-maths', 'Fractions');
+  assert.ok(!(await t.call('remove_topics', { topics: ['Fractions'] })).error);
+  const again = await g.c.call('POST', '/api/p/subjects/gcse-maths/topics', { sections: [{ name: 'Algebra', topics: ['fractions'] }] });
+  assert.equal(again.status, 201, JSON.stringify(again.data));
+  assert.equal(again.data.added, 1);
+  const row = d.row('SELECT status, unit_id FROM topics WHERE user_id = ? AND id = ?', g.id, id);
+  assert.deepEqual([row.status, row.unit_id], ['confirmed', 'gcse-maths-s2'], 'back, and in Algebra');
+  assert.deepEqual(d.rows('SELECT unit_id FROM unit_topics WHERE user_id = ? AND topic_id = ?', g.id, id).map(r => r.unit_id), ['gcse-maths-s2']);
+  const sub = (await g.c.call('GET', '/api/p/subjects/gcse-maths')).data;
+  assert.ok(!sub.sections.some(s => s.name === 'Other'), 'nothing left without a section');
+  assert.equal((await g.c.call('POST', '/api/p/undo', { batch_id: again.data.batch_id })).status, 200);
+  const back = d.row('SELECT status, unit_id FROM topics WHERE user_id = ? AND id = ?', g.id, id);
+  assert.deepEqual([back.status, back.unit_id], ['retired', 'gcse-maths-s1']);
+  d.close();
+});

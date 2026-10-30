@@ -411,18 +411,23 @@ export async function addTopics(env, user, sid, sections, { actor = LEARNER, sur
  */
 export async function planTopics(env, user, sid, sections, { actor = LEARNER, plan = new Plan() } = {}) {
   if (!sidOk(sid)) throw notFoundSubject();
-  const [subj, units, topics, aliases] = await env.DB.batch([
+  const [subj, units, topics, aliases, retiredIn] = await env.DB.batch([
     statement(env, "SELECT id, name, track FROM subjects WHERE user_id = ?1 AND id = ?2 AND status = 'active'", user, sid),
     statement(env, 'SELECT id, name, num FROM units WHERE user_id = ?1 AND category_id = ?2', user, sid),
-    statement(env, 'SELECT id, status FROM topics WHERE user_id = ?1 AND category_id = ?2', user, sid),
+    statement(env, 'SELECT id, status, unit_id FROM topics WHERE user_id = ?1 AND category_id = ?2', user, sid),
     statement(env, `SELECT a.alias_key, a.topic_id, t.status FROM topic_aliases a JOIN topics t ON t.user_id = a.user_id AND t.id = a.topic_id
       WHERE a.user_id = ?1 AND t.category_id = ?2 AND a.status = 'active'`, user, sid),
+    statement(env, `SELECT ut.unit_id, ut.topic_id, ut.role, ut.source, ut.created_by, ut.created_at FROM unit_topics ut
+      JOIN topics t ON t.user_id = ut.user_id AND t.id = ut.topic_id WHERE ut.user_id = ?1 AND t.category_id = ?2 AND t.status = 'retired'`, user, sid),
   ]);
   const subject = (subj.results || [])[0];
   if (!subject) throw notFoundSubject();
   const t = nowMs();
   const createdBy = actor === 'claude' ? 'claude' : LEARNER;
   const taken = new Set((topics.results || []).map(r => r.id));
+  const unitOf = new Map((topics.results || []).map(r => [r.id, r.unit_id ?? null]));
+  const memberships = new Map();
+  for (const m of retiredIn.results || []) { if (!memberships.has(m.topic_id)) memberships.set(m.topic_id, []); memberships.get(m.topic_id).push(m); }
   const live = (topics.results || []).filter(r => ['proposed', 'confirmed'].includes(r.status)).length;
   const byKey = new Map();
   for (const a of aliases.results || []) {
@@ -435,27 +440,45 @@ export async function planTopics(env, user, sid, sections, { actor = LEARNER, pl
   let added = 0, skipped = 0;
   for (const sec of sections) {
     let unit = unitByKey.get(norm(sec.name));
+    const ensureUnit = () => {
+      if (unit) return unit;
+      if (unitCount >= LIMITS.sections_per_subject) throw new HttpError(400, `${subject.name} can have ${LIMITS.sections_per_subject} sections. Use an existing section.`);
+      const uid = unitRow(plan, sid, subject.track, nextNum, sec.name, t);
+      unit = { id: uid, name: sec.name, num: nextNum };
+      unitByKey.set(norm(sec.name), unit);
+      nextNum++; unitCount++;
+      return unit;
+    };
     for (const name of sec.topics) {
       const key = norm(name);
       if (!key) { skipped++; continue; }
       const hit = byKey.get(key);
       if (hit && ['proposed', 'confirmed'].includes(hit.status)) { skipped++; continue; }
       if (hit) {
-        // A retired topic of that name: bring it back.
-        plan.add({ table: 'topics', op: 'update', key: { id: hit.id }, before: { status: 'retired' }, after: { status: 'confirmed', updated_at: t } },
-          { kind: 'topic.updated', target_type: 'topic', target_id: hit.id, topic_id: hit.id, summary: `${name} is back on your list` });
+        // A retired topic of that name: bring it back, in the section asked for (its old one may be gone).
+        const u = ensureUnit();
+        const was = unitOf.has(hit.id) ? unitOf.get(hit.id) : null;
+        const move = was !== u.id;
+        if (move) {
+          for (const m of memberships.get(hit.id) || []) {
+            plan.add({ table: 'unit_topics', op: 'delete', key: { unit_id: m.unit_id, topic_id: hit.id }, before: { role: m.role, source: m.source, created_by: m.created_by, created_at: m.created_at }, after: null },
+              { kind: 'unit.updated', target_type: 'unit_topic', target_id: `${m.unit_id}:${hit.id}`, topic_id: hit.id, summary: `${name} leaves its old section` });
+          }
+          plan.add({ table: 'unit_topics', op: 'insert', key: { unit_id: u.id, topic_id: hit.id }, before: null,
+            after: { role: 'primary', source: 'platform', created_by: createdBy, created_at: t } },
+          { kind: 'unit.updated', target_type: 'unit_topic', target_id: `${u.id}:${hit.id}`, topic_id: hit.id, summary: `${name} sits in ${u.name}` });
+          unitOf.set(hit.id, u.id);
+          memberships.delete(hit.id);
+        }
+        plan.add({ table: 'topics', op: 'update', key: { id: hit.id }, before: move ? { status: 'retired', unit_id: was } : { status: 'retired' },
+          after: move ? { status: 'confirmed', unit_id: u.id, updated_at: t } : { status: 'confirmed', updated_at: t } },
+        { kind: 'topic.updated', target_type: 'topic', target_id: hit.id, topic_id: hit.id, summary: `${name} is back on your list` });
         byKey.set(key, { id: hit.id, status: 'confirmed' });
         added++;
         continue;
       }
       if (live + added >= LIMITS.topics_per_subject) throw new HttpError(400, `${subject.name} can hold ${LIMITS.topics_per_subject} topics. Retire some before adding more.`);
-      if (!unit) {
-        if (unitCount >= LIMITS.sections_per_subject) throw new HttpError(400, `${subject.name} can have ${LIMITS.sections_per_subject} sections. Use an existing section.`);
-        const uid = unitRow(plan, sid, subject.track, nextNum, sec.name, t);
-        unit = { id: uid, name: sec.name, num: nextNum };
-        unitByKey.set(norm(sec.name), unit);
-        nextNum++; unitCount++;
-      }
+      ensureUnit();
       let id = slugId(user, `${sid} ${name}`);
       for (let n = 2; taken.has(id); n++) id = `${slugId(user, `${sid} ${name}`)}-${n}`;
       taken.add(id);
