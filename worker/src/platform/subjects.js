@@ -190,6 +190,15 @@ async function listSubjects(request, env, ctx, params, url, user, session) {
   return json({ subjects: rows.map(shapeSubject) });
 }
 
+/**
+ * Sections in reading order: ones whose name starts with a number ("1 Atomic structure", "17 Thermodynamics") by
+ * that number, then the rest in the order they were made. Pure; keeps the order when nothing is numbered.
+ */
+export function sortSections(list) {
+  const key = s => { const m = /^\s*(\d+)\b/.exec(s.name || ''); return m ? Number(m[1]) : Infinity; };
+  return list.map((s, i) => ({ s, i, k: key(s) })).sort((a, b) => (a.k - b.k) || (a.i - b.i)).map(x => x.s);
+}
+
 /** The subject's sections with their topics, unplaced count and the subject itself: one read batch. */
 export async function readSubject(env, user, sid) {
   if (!sidOk(sid)) throw notFoundSubject();
@@ -203,7 +212,7 @@ export async function readSubject(env, user, sid) {
   ]);
   const row = (subj.results || [])[0];
   if (!row) throw notFoundSubject();
-  const sections = (units.results || []).map(u => ({ id: u.id, name: u.name, topics: [] }));
+  const sections = sortSections((units.results || []).map(u => ({ id: u.id, name: u.name, topics: [] })));
   const byId = new Map(sections.map(s => [s.id, s]));
   const loose = [];
   for (const t of topics.results || []) {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import worker from '../../worker/src/index.js';
 import { PROFILES, platformTracks, errorTypesFor, ERROR_TYPE_SETS, ERROR_LABELS } from '../../worker/src/profiles.js';
 import { BOARDS, SUBJECTS } from '../../worker/src/platform/catalogue.js';
-import { cleanSuggestion, cleanName, daysToExam, ringOf, TOOLS } from '../../worker/src/platform/subjects.js';
+import { cleanSuggestion, cleanName, daysToExam, ringOf, sortSections, TOOLS } from '../../worker/src/platform/subjects.js';
 import { writeBatch } from '../../worker/src/map/events.js';
 import { slugId } from '../../public/js/shared/names.js';
 import { BASE, platformEnv, signedIn } from './platform-helpers.mjs';
@@ -837,4 +837,11 @@ test('sections: rename one, remove an empty one (not one with topics), remove_em
   const renamed = await t.call('subject_edit', { subject: 'Maths', action: 'section', section: 'Brand new', name: 'Fractions and decimals' });
   assert.deepEqual([renamed.error, renamed.data.name], [false, 'Fractions and decimals']);
   d.close();
+});
+
+test('sections read in chapter order: numbered ones by their number, the rest after in the order they were made', () => {
+  const names = l => sortSections(l.map(n => ({ name: n }))).map(s => s.name);
+  assert.deepEqual(names(['17 Thermodynamics', 'Practical skills', '2 Amount of substance', '1 Atomic structure', '10 Group 7', 'Extra']),
+    ['1 Atomic structure', '2 Amount of substance', '10 Group 7', '17 Thermodynamics', 'Practical skills', 'Extra']);
+  assert.deepEqual(names(['Number', 'Algebra', 'Geometry']), ['Number', 'Algebra', 'Geometry'], 'nothing numbered: order kept');
 });
